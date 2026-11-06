@@ -1,0 +1,103 @@
+name: Update game data
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.version.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Check the game version
+        id: version
+        run: |
+          latest=$(python download.py --version)
+          current=$(python -c "import json; print(json.load(open('build.json'))['build'])")
+          echo "current $current, latest $latest"
+          if [ "$latest" != "$current" ]; then echo "build=$latest" >> "$GITHUB_OUTPUT"; fi
+
+  extract:
+    needs: check
+    if: needs.check.outputs.build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # build-file: a data file whose top-level "build" says which build the app has.
+          - repo: kznyo/rotmg-sprite-index
+            build-file: data/index.json
+          - repo: kznyo/rotmg-dps-calculator
+            build-file: data/items.json
+    env:
+      BUILD: ${{ needs.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ secrets.APPS_TOKEN }}
+          path: app
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      # Skips an app that a previous, partly failed run already updated.
+      - name: Check the app's data
+        id: app
+        working-directory: app
+        run: |
+          current=$(python -c "import json, sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['build'])" "${{ matrix.build-file }}")
+          echo "app has $current"
+          if [ "$current" != "$BUILD" ]; then echo "outdated=true" >> "$GITHUB_OUTPUT"; fi
+      # Fails if Deca published yet another build since the check; the next run picks that one up.
+      - name: Download the build
+        if: steps.app.outputs.outdated
+        run: python download.py "$RUNNER_TEMP/builds"
+      - name: Extract
+        if: steps.app.outputs.outdated
+        working-directory: app
+        run: |
+          pip install -r extractor/requirements.txt
+          python -m pytest extractor
+          python extractor/extract.py "$RUNNER_TEMP/builds/$BUILD" data
+      # The app's host rebuilds the site on this push.
+      - name: Commit the data
+        if: steps.app.outputs.outdated
+        working-directory: app
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git commit -m "chore(data): update to build ${BUILD:0:8}"
+          git push
+
+  # Only after every app is updated, so a failed one is retried on the next run.
+  record:
+    needs: [check, extract]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Record the build
+        env:
+          BUILD: ${{ needs.check.outputs.build }}
+        run: |
+          printf '{\n  "build": "%s"\n}\n' "$BUILD" > build.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build.json
+          git commit -m "chore: record build ${BUILD:0:8}"
+          git push
